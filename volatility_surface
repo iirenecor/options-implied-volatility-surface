@@ -1,0 +1,350 @@
+ 
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import yfinance as yf
+from datetime import datetime
+from scipy.stats import norm
+from scipy.optimize import brentq
+from scipy.interpolate import griddata
+ 
+# Configuration
+TICKER = "SPY"
+OUTPUT_FILE = f"{TICKER}_options_chain_{datetime.today().strftime('%Y%m%d')}.csv"
+ 
+MIN_VOLUME = 1
+MIN_OPEN_INTEREST = 1
+ 
+RISK_FREE_RATE = 0.04   # constant risk-free rate (approximation)
+DIVIDEND_YIELD = 0.0    # dividends ignored for simplicity
+ 
+OPTION_TYPE = "call"          # "call" or "put", for the surface
+MONEYNESS_MIN = 0.70
+MONEYNESS_MAX = 1.30
+MIN_IV_PERCENT = 0.5
+MAX_IV_PERCENT = 150
+GRID_POINTS = 20
+ 
+COLUMNS_TO_KEEP = [
+    "contractSymbol", "strike", "lastPrice", "bid", "ask", "volume",
+    "openInterest", "impliedVolatility", "inTheMoney",
+    "expirationDate", "optionType",
+]
+ 
+ 
+# 1. Download
+def get_underlying_price(ticker_obj: yf.Ticker) -> float:
+    return ticker_obj.fast_info["last_price"]
+ 
+ 
+def get_full_options_chain(ticker: str) -> pd.DataFrame:
+    """Download calls and puts for every available expiration."""
+    ticker_obj = yf.Ticker(ticker)
+    expirations = ticker_obj.options
+    if not expirations:
+        raise ValueError(f"No option expirations found for {ticker}")
+ 
+    underlying_price = get_underlying_price(ticker_obj)
+    print(f"Current price of {ticker}: {underlying_price:.2f}")
+    print(f"Available expirations: {len(expirations)}")
+ 
+    chunks = []
+    for exp_date in expirations:
+        chain = ticker_obj.option_chain(exp_date)
+ 
+        calls = chain.calls.copy()
+        calls["optionType"] = "call"
+ 
+        puts = chain.puts.copy()
+        puts["optionType"] = "put"
+ 
+        both = pd.concat([calls, puts], ignore_index=True)
+        both["expirationDate"] = exp_date
+        chunks.append(both)
+ 
+    full_chain = pd.concat(chunks, ignore_index=True)
+    full_chain["underlyingPrice"] = underlying_price
+    return full_chain
+ 
+ 
+# 2. Cleaning and quality filters
+def clean_options_data(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["expirationDate"] = pd.to_datetime(df["expirationDate"])
+ 
+    before = len(df)
+    df = df.drop_duplicates(subset=["contractSymbol"])
+    print(f"Duplicates removed: {before - len(df)}")
+ 
+    key_cols = ["strike", "lastPrice", "bid", "ask", "impliedVolatility"]
+    nulls = df[key_cols].isnull().sum()
+    print("Null values per column:")
+    print(nulls[nulls > 0] if nulls.sum() > 0 else "  none")
+ 
+    print(f"Strikes <= 0: {(df['strike'] <= 0).sum()}")
+    print(f"Negative prices: "
+          f"{((df['bid'] < 0) | (df['ask'] < 0) | (df['lastPrice'] < 0)).sum()}")
+ 
+    return df
+ 
+ 
+def filter_liquid_options(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep only contracts with real activity: volume or open interest."""
+    df = df.copy()
+    liquid = (df["volume"].fillna(0) >= MIN_VOLUME) | \
+             (df["openInterest"].fillna(0) >= MIN_OPEN_INTEREST)
+ 
+    removed = (~liquid).sum()
+    print(f"Options removed for lack of liquidity: {removed} of {len(df)}")
+ 
+    return df[liquid].reset_index(drop=True)
+ 
+ 
+def flag_placeholder_iv(df: pd.DataFrame, min_repeats: int = 5) -> pd.DataFrame:
+    """
+    Removes contracts where Yahoo's IV is a 'placeholder' value (identical
+    across many different strikes/expirations). This reveals that Yahoo
+    could not compute a real IV -- and if its own solver failed, that's a
+    sign the contract's price isn't reliable enough for us to use either.
+    """
+    df = df.copy()
+    counts = df["impliedVolatility"].value_counts()
+    placeholder_values = counts[counts >= min_repeats].index
+ 
+    before = len(df)
+    df = df[~df["impliedVolatility"].isin(placeholder_values)]
+    print(f"Rows removed for placeholder IV from Yahoo: {before - len(df)}")
+ 
+    return df.reset_index(drop=True)
+ 
+ 
+def show_summary(df: pd.DataFrame) -> None:
+    n_calls = (df["optionType"] == "call").sum()
+    n_puts = (df["optionType"] == "put").sum()
+ 
+    print("\n--- DATASET SUMMARY ---")
+    print(f"Total number of options: {len(df)}")
+    print(f"  Calls: {n_calls}")
+    print(f"  Puts:  {n_puts}")
+    print(f"Number of expirations: {df['expirationDate'].nunique()}")
+    print(f"Strike range: {df['strike'].min():.2f} - {df['strike'].max():.2f}")
+    print(f"Expiration range: {df['expirationDate'].min().date()} "
+          f"- {df['expirationDate'].max().date()}")
+ 
+ 
+# 3. Black-Scholes, own implied volatility
+def black_scholes_price(S, K, T, r, sigma, option_type="call", q=DIVIDEND_YIELD):
+    """Black-Scholes price of a European call or put."""
+    if T <= 0 or sigma <= 0:
+        return np.nan
+ 
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+ 
+    if option_type == "call":
+        return S * np.exp(-q * T) * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    else:
+        return K * np.exp(-r * T) * norm.cdf(-d2) - S * np.exp(-q * T) * norm.cdf(-d1)
+ 
+ 
+def implied_volatility(market_price, S, K, T, r, option_type="call"):
+    """Numerically inverts Black-Scholes (bisection) to find sigma."""
+    if T <= 0 or market_price <= 0:
+        return np.nan
+ 
+    def price_diff(sigma):
+        return black_scholes_price(S, K, T, r, sigma, option_type) - market_price
+ 
+    try:
+        low, high = 1e-5, 5.0
+        if price_diff(low) * price_diff(high) > 0:
+            return np.nan
+        return brentq(price_diff, low, high, xtol=1e-6, maxiter=100)
+    except (ValueError, RuntimeError):
+        return np.nan
+ 
+ 
+def compute_own_iv(df: pd.DataFrame) -> pd.DataFrame:
+    """Adds T_years, market_price, and IV_calculated (own IV) to the DataFrame."""
+    df = df.copy()
+    today = pd.Timestamp.today().normalize()
+    df["T_years"] = (df["expirationDate"] - today).dt.days / 365.0
+    df = df[df["T_years"] > 0].copy()
+ 
+    has_quote = (df["bid"] > 0) & (df["ask"] > 0)
+    df["market_price"] = np.where(
+        has_quote, (df["bid"] + df["ask"]) / 2, df["lastPrice"]
+    )
+    print(f"Contracts with a real bid/ask quote: {has_quote.sum()} of {len(df)}")
+    print(f"Contracts using lastPrice as a fallback: {(~has_quote).sum()}")
+ 
+    spot = df["underlyingPrice"].iloc[0]
+ 
+    df["IV_calculated"] = df.apply(
+        lambda row: implied_volatility(
+            market_price=row["market_price"],
+            S=spot,
+            K=row["strike"],
+            T=row["T_years"],
+            r=RISK_FREE_RATE,
+            option_type=row["optionType"],
+        ),
+        axis=1,
+    )
+    df["IV_percent"] = df["IV_calculated"] * 100
+    df["days_to_expiration"] = (df["expirationDate"] - today).dt.days
+ 
+    n_failed = df["IV_calculated"].isna().sum()
+    print(f"Contracts where the IV solver did not converge: {n_failed} of {len(df)}")
+ 
+    valid = df.dropna(subset=["IV_calculated"])
+    diff = valid["IV_percent"] - valid["impliedVolatility"] * 100
+    print("\nDifference (own IV - Yahoo IV), in percentage points:")
+    print(diff.describe())
+ 
+    return df
+ 
+ 
+# 4. Building the surface
+def filter_for_surface(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    spot = df["underlyingPrice"].iloc[0]
+ 
+    df = df[df["optionType"].str.lower() == OPTION_TYPE]
+    df = df[
+        (df["strike"] >= spot * MONEYNESS_MIN) &
+        (df["strike"] <= spot * MONEYNESS_MAX)
+    ]
+    df = df[
+        (df["IV_percent"] >= MIN_IV_PERCENT) &
+        (df["IV_percent"] <= MAX_IV_PERCENT)
+    ]
+    df = df.dropna(subset=["strike", "days_to_expiration", "IV_percent"])
+ 
+    df = (
+        df.groupby(["strike", "days_to_expiration"], as_index=False)["IV_percent"]
+        .mean()
+    )
+ 
+    print(f"\nPoints available for the surface ({OPTION_TYPE}s): {len(df)}")
+    return df
+ 
+ 
+def build_grid(df: pd.DataFrame):
+    strike_grid = np.linspace(df["strike"].min(), df["strike"].max(), GRID_POINTS)
+    days_grid = np.linspace(
+        df["days_to_expiration"].min(), df["days_to_expiration"].max(), GRID_POINTS
+    )
+    X, Y = np.meshgrid(strike_grid, days_grid)
+ 
+    points = (df["strike"], df["days_to_expiration"])
+    Z = griddata(points, df["IV_percent"], (X, Y), method="linear")
+    Z_fallback = griddata(points, df["IV_percent"], (X, Y), method="nearest")
+    Z = np.where(np.isnan(Z), Z_fallback, Z)
+ 
+    return X, Y, Z
+ 
+ 
+def plot_surface(X, Y, Z) -> None:
+    fig = plt.figure(figsize=(12, 8))
+    ax = fig.add_subplot(111, projection="3d")
+ 
+    surface = ax.plot_surface(X, Y, Z, cmap="viridis", edgecolor="none", alpha=0.9)
+ 
+    ax.set_xlabel("Strike ($)")
+    ax.set_ylabel("Days to expiration")
+    ax.set_zlabel("Implied volatility (%)")
+    ax.set_title(f"{TICKER} {OPTION_TYPE.capitalize()} Implied Volatility Surface (own Black-Scholes)")
+ 
+    fig.colorbar(surface, ax=ax, shrink=0.6, label="IV (%)")
+    plt.tight_layout()
+    plt.show()
+ 
+ 
+def plot_iv_comparison(df: pd.DataFrame) -> None:
+    """Scatter plot of own IV vs Yahoo's IV, with a y=x reference line."""
+    valid = df.dropna(subset=["IV_calculated"])
+    yahoo_iv_percent = valid["impliedVolatility"] * 100
+    own_iv_percent = valid["IV_percent"]
+ 
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.scatter(yahoo_iv_percent, own_iv_percent, alpha=0.4, s=15)
+ 
+    max_val = max(yahoo_iv_percent.max(), own_iv_percent.max())
+    ax.plot([0, max_val], [0, max_val], color="red", linestyle="--", label="y = x")
+ 
+    ax.set_xlabel("Yahoo implied volatility (%)")
+    ax.set_ylabel("Own implied volatility (%)")
+    ax.set_title(f"{TICKER}: Own IV (Black-Scholes) vs Yahoo IV")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+ 
+ 
+def generate_summary_table(df: pd.DataFrame) -> str:
+    """Builds a Markdown table with the key dataset stats, for the README."""
+    spot = df["underlyingPrice"].iloc[0]
+    n_calls = (df["optionType"] == "call").sum()
+    n_puts = (df["optionType"] == "put").sum()
+ 
+    valid = df.dropna(subset=["IV_calculated"])
+    diff = valid["IV_percent"] - valid["impliedVolatility"] * 100
+ 
+    table = f"""
+| Metric                          | Value |
+|----------------------------------|-------|
+| Ticker                           | {TICKER} |
+| Underlying price                 | {spot:.2f} |
+| Total number of options          | {len(df)} |
+| Calls                            | {n_calls} |
+| Puts                             | {n_puts} |
+| Number of expirations            | {df['expirationDate'].nunique()} |
+| Strike range                     | {df['strike'].min():.2f} - {df['strike'].max():.2f} |
+| Expiration range                 | {df['expirationDate'].min().date()} to {df['expirationDate'].max().date()} |
+| Contracts with own IV computed   | {valid.shape[0]} of {len(df)} |
+| Mean own IV                      | {valid['IV_percent'].mean():.2f}% |
+| Median own IV                    | {valid['IV_percent'].median():.2f}% |
+| Mean diff. (own IV - Yahoo IV)   | {diff.mean():.2f} pp |
+| Median diff. (own IV - Yahoo IV) | {diff.median():.2f} pp |
+"""
+    return table.strip()
+ 
+ 
+# main
+def main():
+    raw_chain = get_full_options_chain(TICKER)
+    clean_chain = clean_options_data(raw_chain)
+    clean_chain = filter_liquid_options(clean_chain)
+    clean_chain = flag_placeholder_iv(clean_chain)
+ 
+    ordered_cols = COLUMNS_TO_KEEP + ["underlyingPrice"]
+    remaining_cols = [c for c in clean_chain.columns if c not in ordered_cols]
+    clean_chain = clean_chain[ordered_cols + remaining_cols]
+ 
+    show_summary(clean_chain)
+ 
+    with_iv = compute_own_iv(clean_chain)
+    with_iv.to_csv(OUTPUT_FILE, index=False)
+    print(f"\nData saved to: {OUTPUT_FILE}")
+ 
+    summary_table = generate_summary_table(with_iv)
+    summary_path = f"{TICKER}_summary_table.md"
+    with open(summary_path, "w") as f:
+        f.write(summary_table)
+    print(f"Summary table saved to: {summary_path}")
+ 
+    plot_iv_comparison(with_iv)
+ 
+    surface_df = filter_for_surface(with_iv)
+ 
+    if len(surface_df) < 10:
+        print("Too few points left to build the surface.")
+        return
+ 
+    X, Y, Z = build_grid(surface_df)
+    plot_surface(X, Y, Z)
+ 
+ 
+if __name__ == "__main__":
+    main()
+ 
