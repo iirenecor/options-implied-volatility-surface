@@ -59,7 +59,7 @@ Dataset statistics from the latest run:
 | Mean diff. (own IV - Yahoo IV)        | -1.83 pp |
 | Median diff. (own IV - Yahoo IV)      | 0.74 pp |
  
-*(NOTE; Re-run `iv_surface_pipeline.py` to refresh these numbers: they change slightly every day as the market moves and new contracts list)*
+*(NOTE; Re-run volatility_surface.py to refresh these numbers: they change slightly every day as the market moves and new contracts list)*
  
 ## Known limitations
  
@@ -73,7 +73,7 @@ Dataset statistics from the latest run:
  
 ## How to run
  
-Install the dependencies (yfinance, pandas, numpy, scipy, matplotlib), then run iv_surface_pipeline.py. The ticker can be changed at the top of the file.
+Install the dependencies (yfinance, pandas, numpy, scipy, matplotlib), then run volatility_surface.py. The ticker can be changed at the top of the file.
  
 ## Possible next steps
  
